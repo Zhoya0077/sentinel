@@ -365,6 +365,7 @@ const isPolicyMessage = (text) => POLICY_TEXT.some((t) => String(text ?? "").toL
 async function scanApprovalLogs(rpc, { owner, fromBlock, toBlock, chunkSize = 10000, minChunkSize = 500, chainId, onProgress, curatedAddresses }) {
   const ownerTopic = "0x" + padAddress(owner);
   const warnings = [];
+  let skippedRanges = 0;
   async function scanRange(addressFilter) {
     const logs = [];
     let from = fromBlock, chunk = chunkSize;
@@ -380,21 +381,21 @@ async function scanApprovalLogs(rpc, { owner, fromBlock, toBlock, chunkSize = 10
       } catch (err) {
         if (err instanceof RateLimitError) throw err;
         if (isRangeError(err) && chunk > minChunkSize) { chunk = Math.max(minChunkSize, Math.floor(chunk / 2)); warnings.push(`log range ${from}-${chunkTo} rejected; retrying with ${chunk}-block chunks`); continue; }
-        if (isRangeError(err)) { warnings.push(`skipped log range ${from}-${chunkTo}: node rejects even ${chunk}-block chunks`); from = chunkTo + 1; continue; }
+        if (isRangeError(err)) { skippedRanges++; warnings.push(`skipped log range ${from}-${chunkTo}: node rejects even ${chunk}-block chunks`); from = chunkTo + 1; continue; }
         throw err;
       }
     }
     return logs;
   }
   try {
-    return { logs: await scanRange(null), warnings };
+    return { logs: await scanRange(null), warnings, skippedRanges };
   } catch (err) {
     if (err instanceof RateLimitError) throw err;
     if (isPolicyMessage(err.message) && curatedAddresses.length > 0) {
       warnings.push("public node requires an address filter for eth_getLogs; log discovery limited to curated tokens in this scan");
       const logs = [];
       for (const addr of curatedAddresses) logs.push(...await scanRange(addr));
-      return { logs, warnings };
+      return { logs, warnings, skippedRanges };
     }
     throw err;
   }
@@ -479,8 +480,9 @@ async function scanChain(rpc, owner, chainId, { blocks, onProgress, onEvent }) {
   const latestBlock = parseInt(await rpc.call("eth_blockNumber", [], { expectedChainId: chainId }), 16);
   const fromBlock = Math.max(0, latestBlock - blocks);
   onProgress?.({ message: `tip block ${latestBlock}; scanning logs ${fromBlock}-${latestBlock}…` });
-  const { logs, warnings: logWarnings } = await scanApprovalLogs(rpc, { owner, fromBlock, toBlock: latestBlock, chainId, onProgress: (p) => onProgress?.({ message: `logs ${p.from}-${p.to}${p.address ? ` (${p.address.slice(0, 10)}…)` : ""} — ${p.found} events` }), curatedAddresses: CURATED_TOKENS[chainId].map((t) => t.address) });
+  const { logs, warnings: logWarnings, skippedRanges } = await scanApprovalLogs(rpc, { owner, fromBlock, toBlock: latestBlock, chainId, onProgress: (p) => onProgress?.({ message: `logs ${p.from}-${p.to}${p.address ? ` (${p.address.slice(0, 10)}…)` : ""} — ${p.found} events` }), curatedAddresses: CURATED_TOKENS[chainId].map((t) => t.address) });
   warnings.push(...logWarnings);
+  const logDiscovery = skippedRanges === 0 ? "complete" : (logs.length > 0 ? "partial" : "unavailable");
   const pairs = new Map();
   for (const p of uniquePairs(logs)) pairs.set(`${p.token}:${p.spender}`, p);
   for (const token of CURATED_TOKENS[chainId]) for (const spender of KNOWN_SPENDERS[chainId]) {
@@ -522,7 +524,7 @@ async function scanChain(rpc, owner, chainId, { blocks, onProgress, onEvent }) {
     const scored = scoreApproval({ allowance, balance: balance ?? 0n, spenderIsEOA: spenderEOA === true, known, ageDays, exposureCents: exposure == null ? null : Number(exposure) });
     approvals.push({
       chainId, token: pair.token, tokenSymbol: meta.symbol ?? hints.get(pair.token)?.hint ?? null, decimals: meta.decimals,
-      spender: pair.spender, spenderLabel: known?.label ?? null, spenderIsEOA,
+      spender: pair.spender, spenderLabel: known?.label ?? null, spenderIsEOA: spenderEOA === true,
       allowance: allowance.toString(10), balance: (balance ?? 0n).toString(10), unlimited: scored.unlimited,
       ageDays: ageDays == null ? null : Math.floor(ageDays), earliestBlock: pair.earliestBlock, earliestTx: pair.earliestTx,
       discoveredVia: pair.earliestBlock != null ? "approval-log" : "known-spender-sweep",
@@ -533,7 +535,7 @@ async function scanChain(rpc, owner, chainId, { blocks, onProgress, onEvent }) {
     });
   })));
   approvals.sort((a, b) => b.score - a.score);
-  return { owner, chainId, chainName: chain.name, scannedFromBlock: fromBlock, scannedToBlock: latestBlock, scannedAt: new Date().toISOString(), pairsConsidered: pairs.size, approvals, warnings, partial: false };
+  return { owner, chainId, chainName: chain.name, scannedFromBlock: fromBlock, scannedToBlock: latestBlock, scannedAt: new Date().toISOString(), pairsConsidered: pairs.size, approvals, warnings, partial: false, logDiscovery, skippedLogRanges: skippedRanges };
 }
 
 // ---------- canonical report hash ----------
@@ -594,7 +596,7 @@ function renderReport(report, diff) {
   currentReport = report;
   els.results.style.display = "block";
   const chain = CHAINS[report.chainId];
-  els.reportMeta.innerHTML = `Wallet <code>${escapeHtml(report.owner)}</code> · ${escapeHtml(report.chainName)} · scanned ${escapeHtml(report.scannedAt)} · log window blocks ${report.scannedFromBlock}–${report.scannedToBlock} · pairs checked ${report.pairsConsidered}${report.partial ? " · <b>PARTIAL</b>" : ""}`;
+  els.reportMeta.innerHTML = `Wallet <code>${escapeHtml(report.owner)}</code> · ${escapeHtml(report.chainName)} · scanned ${escapeHtml(report.scannedAt)} · log window blocks ${report.scannedFromBlock}–${report.scannedToBlock} · pairs checked ${report.pairsConsidered}${report.partial ? " · <b>PARTIAL</b>" : ""}${report.logDiscovery && report.logDiscovery !== "complete" ? ` · log discovery: <b>${escapeHtml(report.logDiscovery)}</b>` : ""}`;
   const counts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
   for (const a of report.approvals) counts[a.level]++;
   els.chips.innerHTML = [
@@ -616,7 +618,10 @@ function renderReport(report, diff) {
   reportHash(report).then((h) => { els.hashBox.textContent = `report hash (SHA-256 of canonical report): ${h}`; });
   els.approvals.innerHTML = "";
   if (report.approvals.length === 0) {
-    els.approvals.innerHTML = `<div class="card">No live approvals found in the scanned window. Note: approvals granted before the window appear only via the known-spender sweep; use a larger window or the CLI for deeper history.</div>`;
+    const coverageCard = report.logDiscovery === "unavailable"
+      ? `Log discovery returned nothing in this scan — the public node rejected every log query — so this result rests only on the known-spender sweep (${report.pairsConsidered} pairs checked). Approvals to spenders outside the sweep would not be seen; retry later or use the CLI for deeper history.`
+      : `Note: approvals granted before the window appear only via the known-spender sweep; use a larger window or the CLI for deeper history.`;
+    els.approvals.innerHTML = `<div class="card">No live approvals found in the scanned window. ${coverageCard}</div>`;
     return;
   }
   for (const a of report.approvals) {
@@ -672,8 +677,9 @@ async function runScan() {
     const diff = previousReport && previousReport.chainId === chainId ? diffReports(previousReport, report) : null;
     previousReport = report;
     for (const w of report.warnings) alertBox("warn", escapeHtml(w));
-    if (report.approvals.length === 0) log("scan complete: no live approvals found.", "good");
-    else log(`scan complete: ${report.approvals.length} live approval(s).`, "good");
+    const coverageNote = report.logDiscovery === "complete" ? "" : report.logDiscovery === "unavailable" ? " Log discovery returned nothing (node rejected every log query) — this result rests only on the known-spender sweep." : " Log discovery was partial (some ranges skipped) — results may miss approvals outside the sweep.";
+    if (report.approvals.length === 0) log(`scan complete: no live approvals found.${coverageNote}`, "good");
+    else log(`scan complete: ${report.approvals.length} live approval(s).${coverageNote}`, "good");
     renderReport(report, diff);
     return true;
   } catch (err) {
@@ -708,6 +714,7 @@ function scheduleWatch() {
   watchTimer = setTimeout(tick, interval);
 }
 
+els.address.addEventListener("input", () => { els.addrError.style.display = "none"; });
 els.scanBtn.addEventListener("click", async () => { await runScan(); scheduleWatch(); });
 els.stopBtn.addEventListener("click", () => { if (abortController) abortController.abort(); });
 els.watchToggle.addEventListener("change", () => { scheduleWatch(); if (els.watchToggle.checked) log("auto re-scan enabled."); });
